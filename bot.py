@@ -1,5 +1,8 @@
 import os
+import json
+import threading
 import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -18,50 +21,138 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 # ================= CONFIGURACIÓN =================
-TELEGRAM_TOKEN = "8792380999:AAGR6XRD4Rkv6rD2d3_c6P00UpHMx10QLiQ"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8792380999:AAGR6XRD4Rkv6rD2d3_c6P00UpHMx10QLiQ")
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 TIMEZONE_STR = 'America/Bogota'
 LOCAL_TZ = pytz.timezone(TIMEZONE_STR)
 
-USUARIO_CHAT_ID = None
+ARCHIVO_CHAT_ID = "chat_id.txt"
+USUARIO_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+if USUARIO_CHAT_ID:
+    USUARIO_CHAT_ID = int(USUARIO_CHAT_ID)
+elif os.path.exists(ARCHIVO_CHAT_ID):
+    try:
+        with open(ARCHIVO_CHAT_ID, "r") as f:
+            USUARIO_CHAT_ID = int(f.read().strip())
+    except Exception:
+        USUARIO_CHAT_ID = None
+
 EVENTOS_NOTIFICADOS = set()
 
-# Estados para la creación guiada de eventos
-TITULO, FECHA, HORA, DURACION = range(4)
+# Estados para la creación y reagendamiento guiado de eventos
+TITULO, FECHA, HORA, DURACION, REAGENDAR_FECHA, REAGENDAR_HORA = range(6)
 # =================================================
 
+
+def guardar_chat_id(chat_id: int):
+    global USUARIO_CHAT_ID
+    USUARIO_CHAT_ID = chat_id
+    try:
+        with open(ARCHIVO_CHAT_ID, "w") as f:
+            f.write(str(chat_id))
+    except Exception:
+        pass
+
+
 def get_calendar_service():
-    """Autentica con Google Calendar usando token.json."""
+    """Autentica con Google Calendar (soporta token.json local o GOOGLE_TOKEN_JSON en Render)."""
     creds = None
-    if os.path.exists('token.json'):
+    token_env = os.environ.get("GOOGLE_TOKEN_JSON")
+
+    if token_env:
+        info = json.loads(token_env)
+        creds = Credentials.from_authorized_user_info(info, SCOPES)
+    elif os.path.exists('token.json'):
         creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
+            if not token_env:
+                with open('token.json', 'w') as token:
+                    token.write(creds.to_json())
         else:
+            if not os.path.exists('credentials.json'):
+                raise RuntimeError(
+                    "Falta configurar GOOGLE_TOKEN_JSON en Environment Variables de Render."
+                )
             flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
             creds = flow.run_local_server(port=0)
-        with open('token.json', 'w') as token:
-            token.write(creds.to_json())
+            with open('token.json', 'w') as token:
+                token.write(creds.to_json())
+
     return build('calendar', 'v3', credentials=creds)
 
-# ----------------- MENÚ PRINCIPAL -----------------
+
+# ----------------- MINI SERVIDOR WEB PARA RENDER -----------------
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write("Bot de Agenda activo 24/7".encode("utf-8"))
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
+def iniciar_servidor_web_nube():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    hilo = threading.Thread(target=server.serve_forever, daemon=True)
+    hilo.start()
+    print(f"🌐 Puerto web {port} abierto correctamente para Render", flush=True)
+
+
+# ----------------- TECLADOS Y MENÚS -----------------
 
 def obtener_teclado_principal():
     teclado = [
-        [InlineKeyboardButton("☀️ Ver Agenda de Hoy", callback_data="btn_hoy")],
+        [InlineKeyboardButton("☀️ Ver Agenda de Hoy (Gestionar)", callback_data="btn_hoy")],
         [InlineKeyboardButton("📅 Ver Próximos 7 Días", callback_data="btn_semana")],
         [InlineKeyboardButton("➕ Nuevo Evento Puntual", callback_data="btn_crear")],
         [InlineKeyboardButton("🔁 Nuevo Evento Diario", callback_data="btn_diario")]
     ]
     return InlineKeyboardMarkup(teclado)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global USUARIO_CHAT_ID
-    USUARIO_CHAT_ID = update.effective_chat.id
 
+def obtener_teclado_acciones_evento(ev_id: str, ya_terminado: bool = False):
+    botones = []
+    if not ya_terminado:
+        botones.append([InlineKeyboardButton("✅ Dar por Terminada", callback_data=f"done_{ev_id}")])
+
+    botones.extend([
+        [
+            InlineKeyboardButton("💤 +10 min", callback_data=f"snooze_{ev_id}_10"),
+            InlineKeyboardButton("💤 +15 min", callback_data=f"snooze_{ev_id}_15"),
+        ],
+        [
+            InlineKeyboardButton("💤 +30 min", callback_data=f"snooze_{ev_id}_30"),
+            InlineKeyboardButton("💤 +1 hora", callback_data=f"snooze_{ev_id}_60"),
+        ],
+        [
+            InlineKeyboardButton("📅 Reagendar", callback_data=f"resched_{ev_id}"),
+            InlineKeyboardButton("🗑️ Eliminar", callback_data=f"del_{ev_id}"),
+        ],
+        [
+            InlineKeyboardButton("☀️ Ir a Agenda de Hoy", callback_data="btn_hoy"),
+            InlineKeyboardButton("⬅️ Menú", callback_data="btn_volver"),
+        ]
+    ])
+    return InlineKeyboardMarkup(botones)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    guardar_chat_id(update.effective_chat.id)
     texto = (
         "👋 *Bienvenido a tu Asistente Personal de Agenda*\n\n"
+        f"🆔 Tu Chat ID es: `{update.effective_chat.id}`\n\n"
         "Selecciona una opción del menú:"
     )
     if update.message:
@@ -69,18 +160,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.callback_query:
         await update.callback_query.edit_message_text(texto, reply_markup=obtener_teclado_principal(), parse_mode="Markdown")
 
-# ----------------- ACCIONES DEL MENÚ -----------------
+
+# ----------------- ACCIONES DEL MENÚ Y GESTIÓN DE EVENTOS -----------------
 
 async def menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    guardar_chat_id(update.effective_chat.id)
+    data = query.data
 
-    if query.data == "btn_hoy":
+    if data == "btn_hoy":
         await mostrar_agenda_hoy(query)
-    elif query.data == "btn_semana":
+    elif data == "btn_semana":
         await mostrar_agenda_semana(query)
-    elif query.data == "btn_volver":
+    elif data == "btn_volver":
         await query.edit_message_text("Selecciona una opción del menú:", reply_markup=obtener_teclado_principal())
+    elif data.startswith("ver_"):
+        ev_id = data.replace("ver_", "", 1)
+        await mostrar_detalle_evento(query, ev_id)
+    elif data.startswith("done_"):
+        ev_id = data.replace("done_", "", 1)
+        await marcar_evento_terminado(query, ev_id)
+    elif data.startswith("snooze_"):
+        partes = data.split("_")
+        minutos = int(partes[-1])
+        ev_id = "_".join(partes[1:-1])
+        await posponer_evento(query, ev_id, minutos)
+    elif data.startswith("del_"):
+        ev_id = data.replace("del_", "", 1)
+        await eliminar_evento(query, ev_id)
+
 
 async def mostrar_agenda_hoy(query):
     try:
@@ -98,25 +207,141 @@ async def mostrar_agenda_hoy(query):
         ).execute()
 
         eventos = res.get('items', [])
-        teclado = [[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="btn_volver")]]
-        
         if not eventos:
+            teclado = [[InlineKeyboardButton("⬅️ Volver al Menú", callback_data="btn_volver")]]
             await query.edit_message_text("🌴 No tienes actividades agendadas para hoy.", reply_markup=InlineKeyboardMarkup(teclado))
             return
 
-        texto = f"📅 *Tu Agenda para Hoy ({ahora.strftime('%d/%m/%Y')}):*\n\n"
+        texto = (
+            f"📅 *Tu Agenda para Hoy ({ahora.strftime('%d/%m/%Y')}):*\n"
+            "_Toca cualquier actividad abajo para terminarla, posponerla o reagendarla:_\n\n"
+        )
+        botones_eventos = []
+
         for ev in eventos:
+            ev_id = ev['id']
+            titulo = ev.get('summary', 'Sin título')
             start_raw = ev['start'].get('dateTime', ev['start'].get('date'))
             if 'T' in start_raw:
                 dt = datetime.datetime.fromisoformat(start_raw)
                 hora = dt.strftime('%I:%M %p')
             else:
                 hora = "Todo el día"
-            texto += f"▫️ *{hora}* - {ev.get('summary', 'Sin título')}\n"
 
-        await query.edit_message_text(texto, reply_markup=InlineKeyboardMarkup(teclado), parse_mode="Markdown")
+            icono = "✅" if titulo.startswith("✅") else "🕒"
+            texto += f"{icono} *{hora}* - {titulo}\n"
+            botones_eventos.append([InlineKeyboardButton(f"{icono} {hora} | {titulo[:28]}", callback_data=f"ver_{ev_id}")])
+
+        botones_eventos.append([InlineKeyboardButton("⬅️ Volver al Menú", callback_data="btn_volver")])
+        await query.edit_message_text(texto, reply_markup=InlineKeyboardMarkup(botones_eventos), parse_mode="Markdown")
     except Exception as e:
-        await query.edit_message_text(f"❌ Error al consultar agenda: {e}")
+        await query.edit_message_text(f"❌ Error al consultar agenda: {e}", reply_markup=obtener_teclado_principal())
+
+
+async def mostrar_detalle_evento(query, ev_id: str):
+    try:
+        service = get_calendar_service()
+        ev = service.events().get(calendarId='primary', eventId=ev_id).execute()
+        titulo = ev.get('summary', 'Sin título')
+        start_raw = ev['start'].get('dateTime', ev['start'].get('date'))
+
+        if 'T' in start_raw:
+            dt = datetime.datetime.fromisoformat(start_raw)
+            fecha_hora = dt.strftime('%d/%m/%Y a las %I:%M %p')
+        else:
+            fecha_hora = f"{start_raw} (Todo el día)"
+
+        terminado = titulo.startswith("✅")
+        estado_txt = "Completada ✅" if terminado else "Pendiente ⏳"
+
+        texto = (
+            f"📌 *Actividad:* {titulo}\n"
+            f"🕒 *Horario:* {fecha_hora}\n"
+            f"📊 *Estado:* {estado_txt}\n\n"
+            "¿Qué deseas hacer con esta actividad?"
+        )
+        await query.edit_message_text(
+            texto,
+            reply_markup=obtener_teclado_acciones_evento(ev_id, ya_terminado=terminado),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await query.edit_message_text(f"❌ No se pudo abrir la actividad: {e}", reply_markup=obtener_teclado_principal())
+
+
+async def marcar_evento_terminado(query, ev_id: str):
+    try:
+        service = get_calendar_service()
+        ev = service.events().get(calendarId='primary', eventId=ev_id).execute()
+        titulo = ev.get('summary', 'Actividad')
+
+        if not titulo.startswith("✅"):
+            ev['summary'] = f"✅ {titulo}"
+        ev['colorId'] = '10'
+
+        service.events().update(calendarId='primary', eventId=ev_id, body=ev).execute()
+        await query.edit_message_text(
+            f"🎉 *¡Actividad completada!*\n\nSe marcó como terminada:\n*{ev['summary']}*",
+            reply_markup=obtener_teclado_principal(),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await query.edit_message_text(f"❌ Error al marcar como terminada: {e}", reply_markup=obtener_teclado_principal())
+
+
+async def posponer_evento(query, ev_id: str, minutos: int):
+    try:
+        service = get_calendar_service()
+        ev = service.events().get(calendarId='primary', eventId=ev_id).execute()
+        titulo = ev.get('summary', 'Actividad')
+
+        start_raw = ev['start'].get('dateTime')
+        end_raw = ev['end'].get('dateTime')
+        ahora = datetime.datetime.now(LOCAL_TZ)
+
+        if start_raw and end_raw:
+            dt_inicio = datetime.datetime.fromisoformat(start_raw)
+            dt_fin = datetime.datetime.fromisoformat(end_raw)
+            duracion = dt_fin - dt_inicio
+            if duracion.total_seconds() <= 0:
+                duracion = datetime.timedelta(minutes=30)
+            base = max(dt_inicio, ahora)
+            nuevo_inicio = base + datetime.timedelta(minutes=minutos)
+            nuevo_fin = nuevo_inicio + duracion
+        else:
+            nuevo_inicio = ahora + datetime.timedelta(minutes=minutos)
+            nuevo_fin = nuevo_inicio + datetime.timedelta(minutes=30)
+
+        ev['start'] = {'dateTime': nuevo_inicio.isoformat(), 'timeZone': TIMEZONE_STR}
+        ev['end'] = {'dateTime': nuevo_fin.isoformat(), 'timeZone': TIMEZONE_STR}
+
+        actualizado = service.events().update(calendarId='primary', eventId=ev_id, body=ev).execute()
+        await query.edit_message_text(
+            f"💤 *Actividad Pospuesta (+{minutos} min)*\n\n"
+            f"📌 *{titulo}*\n"
+            f"🕒 Nueva hora: *{nuevo_inicio.strftime('%I:%M %p')}* ({nuevo_inicio.strftime('%d/%m/%Y')})\n"
+            "🔔 _Te volveré a avisar cuando se acerque la nueva hora._",
+            reply_markup=obtener_teclado_acciones_evento(actualizado['id'], ya_terminado=titulo.startswith("✅")),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await query.edit_message_text(f"❌ Error al posponer actividad: {e}", reply_markup=obtener_teclado_principal())
+
+
+async def eliminar_evento(query, ev_id: str):
+    try:
+        service = get_calendar_service()
+        ev = service.events().get(calendarId='primary', eventId=ev_id).execute()
+        titulo = ev.get('summary', 'Actividad')
+        service.events().delete(calendarId='primary', eventId=ev_id).execute()
+        await query.edit_message_text(
+            f"🗑️ *Actividad eliminada:*\n_{titulo}_",
+            reply_markup=obtener_teclado_principal(),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await query.edit_message_text(f"❌ Error al eliminar: {e}", reply_markup=obtener_teclado_principal())
+
 
 async def mostrar_agenda_semana(query):
     try:
@@ -153,76 +378,155 @@ async def mostrar_agenda_semana(query):
     except Exception as e:
         await query.edit_message_text(f"❌ Error: {e}")
 
-# ------------- FLUJO PASO A PASO PARA CREAR EVENTOS -------------
+
+# ------------- FLUJO PARA REAGENDAR EVENTO -------------
+
+async def iniciar_reagendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    ev_id = query.data.replace("resched_", "", 1)
+    context.user_data['reagendar_ev_id'] = ev_id
+
+    ahora = datetime.datetime.now(LOCAL_TZ)
+    hoy_str = ahora.strftime("%Y-%m-%d")
+    manana_str = (ahora + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    pasado_str = (ahora + datetime.timedelta(days=2)).strftime("%Y-%m-%d")
+
+    teclado = [
+        [
+            InlineKeyboardButton(f"Hoy ({ahora.strftime('%d/%m')})", callback_data=f"rfecha_{hoy_str}"),
+            InlineKeyboardButton(f"Mañana ({(ahora + datetime.timedelta(days=1)).strftime('%d/%m')})", callback_data=f"rfecha_{manana_str}"),
+        ],
+        [
+            InlineKeyboardButton(f"Pasado mañana ({(ahora + datetime.timedelta(days=2)).strftime('%d/%m')})", callback_data=f"rfecha_{pasado_str}"),
+        ]
+    ]
+    await query.message.reply_text(
+        "📅 *Reagendar Actividad*\n\nElige la *nueva fecha* o escríbela en formato `DD/MM/AAAA` (o envía /cancelar):",
+        reply_markup=InlineKeyboardMarkup(teclado),
+        parse_mode="Markdown"
+    )
+    return REAGENDAR_FECHA
+
+
+async def reagendar_recibir_fecha_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['reagendar_fecha'] = query.data.replace("rfecha_", "")
+    await query.message.reply_text("🕒 Escribe la *nueva hora* en formato 24h (ej: `09:00`, `14:30`):", parse_mode="Markdown")
+    return REAGENDAR_HORA
+
+
+async def reagendar_recibir_fecha_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    texto = update.message.text.strip()
+    try:
+        dt = datetime.datetime.strptime(texto, "%d/%m/%Y")
+        context.user_data['reagendar_fecha'] = dt.strftime("%Y-%m-%d")
+        await update.message.reply_text("🕒 Escribe la *nueva hora* en formato 24h (ej: `09:00`, `14:30`):", parse_mode="Markdown")
+        return REAGENDAR_HORA
+    except ValueError:
+        await update.message.reply_text("⚠️ Fecha no válida. Usa `DD/MM/AAAA`:", parse_mode="Markdown")
+        return REAGENDAR_FECHA
+
+
+async def reagendar_recibir_hora(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    hora_texto = update.message.text.strip()
+    try:
+        datetime.datetime.strptime(hora_texto, "%H:%M")
+    except ValueError:
+        await update.message.reply_text("⚠️ Hora no válida. Usa `HH:MM` (ej: `08:30`):", parse_mode="Markdown")
+        return REAGENDAR_HORA
+
+    ev_id = context.user_data.get('reagendar_ev_id')
+    fecha_str = context.user_data.get('reagendar_fecha')
+
+    try:
+        service = get_calendar_service()
+        ev = service.events().get(calendarId='primary', eventId=ev_id).execute()
+        titulo = ev.get('summary', 'Actividad')
+
+        start_raw = ev['start'].get('dateTime')
+        end_raw = ev['end'].get('dateTime')
+        duracion = datetime.timedelta(minutes=60)
+        if start_raw and end_raw:
+            d = datetime.datetime.fromisoformat(end_raw) - datetime.datetime.fromisoformat(start_raw)
+            if d.total_seconds() > 0:
+                duracion = d
+
+        nuevo_inicio = LOCAL_TZ.localize(datetime.datetime.strptime(f"{fecha_str} {hora_texto}", "%Y-%m-%d %H:%M"))
+        nuevo_fin = nuevo_inicio + duracion
+
+        ev['start'] = {'dateTime': nuevo_inicio.isoformat(), 'timeZone': TIMEZONE_STR}
+        ev['end'] = {'dateTime': nuevo_fin.isoformat(), 'timeZone': TIMEZONE_STR}
+
+        service.events().update(calendarId='primary', eventId=ev_id, body=ev).execute()
+        await update.message.reply_text(
+            f"✅ *Actividad Reagendada*\n\n📌 *{titulo}*\n📅 {nuevo_inicio.strftime('%d/%m/%Y')}\n🕒 {nuevo_inicio.strftime('%I:%M %p')}",
+            reply_markup=obtener_teclado_principal(),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error al reagendar: {e}", reply_markup=obtener_teclado_principal())
+
+    return ConversationHandler.END
+
+
+# ------------- FLUJO PARA CREAR EVENTO -------------
 
 async def iniciar_creacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     es_diario = (query.data == "btn_diario")
     context.user_data['es_diario'] = es_diario
-
     tipo_texto = "recurrente diario" if es_diario else "puntual"
     await query.message.reply_text(
-        f"✍️ Vamos a crear un evento *{tipo_texto}*.\n\n"
-        "Escribe el *título o nombre* del evento (o envía /cancelar para salir):",
+        f"✍️ Vamos a crear un evento *{tipo_texto}*.\n\nEscribe el *título* del evento (o /cancelar):",
         parse_mode="Markdown"
     )
     return TITULO
 
+
 async def recibir_titulo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['titulo'] = update.message.text.strip()
-
     if context.user_data.get('es_diario'):
-        await update.message.reply_text(
-            "🕒 ¿A qué hora debe comenzar todos los días?\n\n"
-            "Ejemplos: `07:30`, `14:00`, `20:15`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("🕒 ¿A qué hora todos los días? (ej: `07:30`, `14:00`):", parse_mode="Markdown")
         return HORA
 
     ahora = datetime.datetime.now(LOCAL_TZ)
     hoy_str = ahora.strftime("%Y-%m-%d")
     manana_str = (ahora + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-
     teclado = [
         [InlineKeyboardButton(f"Hoy ({ahora.strftime('%d/%m')})", callback_data=f"fecha_{hoy_str}")],
         [InlineKeyboardButton(f"Mañana ({(ahora + datetime.timedelta(days=1)).strftime('%d/%m')})", callback_data=f"fecha_{manana_str}")],
     ]
     await update.message.reply_text(
-        "📅 Elige la fecha o escríbela en formato `DD/MM/AAAA` (por ej: `22/10/2026`):",
+        "📅 Elige la fecha o escríbela en formato `DD/MM/AAAA`:",
         reply_markup=InlineKeyboardMarkup(teclado),
         parse_mode="Markdown"
     )
     return FECHA
 
+
 async def recibir_fecha_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    fecha_sel = query.data.replace("fecha_", "")
-    context.user_data['fecha'] = fecha_sel
-
-    await query.message.reply_text(
-        "🕒 ¿A qué hora comienza el evento?\n\n"
-        "Ejemplos: `08:00`, `15:30`, `19:00` (formato 24 horas)",
-        parse_mode="Markdown"
-    )
+    context.user_data['fecha'] = query.data.replace("fecha_", "")
+    await query.message.reply_text("🕒 ¿A qué hora comienza? (ej: `08:00`, `15:30`):", parse_mode="Markdown")
     return HORA
+
 
 async def recibir_fecha_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto = update.message.text.strip()
     try:
         dt = datetime.datetime.strptime(texto, "%d/%m/%Y")
         context.user_data['fecha'] = dt.strftime("%Y-%m-%d")
-        await update.message.reply_text(
-            "🕒 ¿A qué hora comienza el evento?\n\n"
-            "Ejemplos: `08:00`, `15:30`, `19:00`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("🕒 ¿A qué hora comienza? (ej: `08:00`, `15:30`):", parse_mode="Markdown")
         return HORA
     except ValueError:
-        await update.message.reply_text("⚠️ Fecha inválida. Usa el formato `DD/MM/AAAA` (por ejemplo: `22/10/2026`):", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Usa el formato `DD/MM/AAAA`:", parse_mode="Markdown")
         return FECHA
+
 
 async def recibir_hora(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hora_texto = update.message.text.strip()
@@ -230,7 +534,7 @@ async def recibir_hora(update: Update, context: ContextTypes.DEFAULT_TYPE):
         datetime.datetime.strptime(hora_texto, "%H:%M")
         context.user_data['hora'] = hora_texto
     except ValueError:
-        await update.message.reply_text("⚠️ Hora no válida. Escribe la hora en formato HH:MM (por ej: `08:30` o `17:00`):", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Escribe la hora en formato `HH:MM`:", parse_mode="Markdown")
         return HORA
 
     teclado = [
@@ -241,6 +545,7 @@ async def recibir_hora(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ ¿Cuánto dura la actividad?", reply_markup=InlineKeyboardMarkup(teclado))
     return DURACION
 
+
 async def finalizar_creacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -249,7 +554,6 @@ async def finalizar_creacion(update: Update, context: ContextTypes.DEFAULT_TYPE)
     titulo = context.user_data['titulo']
     hora_str = context.user_data['hora']
     es_diario = context.user_data.get('es_diario', False)
-
     h, m = map(int, hora_str.split(':'))
     service = get_calendar_service()
 
@@ -259,7 +563,6 @@ async def finalizar_creacion(update: Update, context: ContextTypes.DEFAULT_TYPE)
             duracion = 60 if dur_str == "allday" else int(dur_str)
             inicio_dt = ahora.replace(hour=h, minute=m, second=0, microsecond=0)
             fin_dt = inicio_dt + datetime.timedelta(minutes=duracion)
-
             cuerpo = {
                 'summary': titulo,
                 'start': {'dateTime': inicio_dt.isoformat(), 'timeZone': TIMEZONE_STR},
@@ -274,15 +577,9 @@ async def finalizar_creacion(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         else:
             fecha_str = context.user_data['fecha']
-            inicio_dt = datetime.datetime.strptime(f"{fecha_str} {hora_str}", "%Y-%m-%d %H:%M")
-            inicio_dt = LOCAL_TZ.localize(inicio_dt)
-
+            inicio_dt = LOCAL_TZ.localize(datetime.datetime.strptime(f"{fecha_str} {hora_str}", "%Y-%m-%d %H:%M"))
             if dur_str == "allday":
-                cuerpo = {
-                    'summary': titulo,
-                    'start': {'date': fecha_str},
-                    'end': {'date': fecha_str},
-                }
+                cuerpo = {'summary': titulo, 'start': {'date': fecha_str}, 'end': {'date': fecha_str}}
                 detalle_dur = "Todo el día"
             else:
                 duracion = int(dur_str)
@@ -296,18 +593,20 @@ async def finalizar_creacion(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
             service.events().insert(calendarId='primary', body=cuerpo).execute()
             await query.edit_message_text(
-                f"✅ *Evento Agendado con Éxito*\n\n📌 *{titulo}*\n📅 {fecha_str}\n🕒 {hora_str} ({detalle_dur})",
+                f"✅ *Evento Agendado*\n\n📌 *{titulo}*\n📅 {fecha_str}\n🕒 {hora_str} ({detalle_dur})",
                 reply_markup=obtener_teclado_principal(),
                 parse_mode="Markdown"
             )
     except Exception as e:
-        await query.edit_message_text(f"❌ Error al guardar en Google Calendar: {e}", reply_markup=obtener_teclado_principal())
+        await query.edit_message_text(f"❌ Error al guardar: {e}", reply_markup=obtener_teclado_principal())
 
     return ConversationHandler.END
+
 
 async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Operación cancelada.", reply_markup=obtener_teclado_principal())
     return ConversationHandler.END
+
 
 # ----------------- RECORDATORIOS AUTOMÁTICOS -----------------
 
@@ -331,33 +630,47 @@ async def verificar_recordatorios(context: ContextTypes.DEFAULT_TYPE):
 
         for ev in res.get('items', []):
             ev_id = ev['id']
-            if ev_id in EVENTOS_NOTIFICADOS:
+            titulo = ev.get('summary', 'Actividad')
+            if titulo.startswith("✅"):
                 continue
 
             start_raw = ev['start'].get('dateTime')
-            if start_raw:
-                dt_evento = datetime.datetime.fromisoformat(start_raw)
-                minutos = int((dt_evento - ahora).total_seconds() / 60)
-                if 0 <= minutos <= 10:
-                    EVENTOS_NOTIFICADOS.add(ev_id)
-                    mensaje = (
-                        f"⏰ *RECORDATORIO DE TU AGENDA*\n\n"
-                        f"📌 *{ev.get('summary', 'Actividad')}*\n"
-                        f"🕒 Comienza en aprox. *{minutos} minutos* ({dt_evento.strftime('%I:%M %p')})"
-                    )
-                    await context.bot.send_message(chat_id=USUARIO_CHAT_ID, text=mensaje, parse_mode="Markdown")
-    except Exception:
-        pass
+            if not start_raw:
+                continue
+
+            clave_notif = (ev_id, start_raw)
+            if clave_notif in EVENTOS_NOTIFICADOS:
+                continue
+
+            dt_evento = datetime.datetime.fromisoformat(start_raw)
+            minutos = int((dt_evento - ahora).total_seconds() / 60)
+            if 0 <= minutos <= 10:
+                EVENTOS_NOTIFICADOS.add(clave_notif)
+                mensaje = (
+                    f"⏰ *RECORDATORIO DE TU AGENDA*\n\n"
+                    f"📌 *{titulo}*\n"
+                    f"🕒 Comienza en aprox. *{minutos} minutos* ({dt_evento.strftime('%I:%M %p')})\n\n"
+                    "👇 _¿Qué deseas hacer con esta actividad?_"
+                )
+                await context.bot.send_message(
+                    chat_id=USUARIO_CHAT_ID,
+                    text=mensaje,
+                    reply_markup=obtener_teclado_acciones_evento(ev_id, ya_terminado=False),
+                    parse_mode="Markdown"
+                )
+    except Exception as e:
+        print(f"Error en recordatorios: {e}", flush=True)
+
 
 # ----------------- INICIO -----------------
 
 if __name__ == '__main__':
+    iniciar_servidor_web_nube()
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(iniciar_creacion, pattern="^(btn_crear|btn_diario)$")
-        ],
+    conv_crear = ConversationHandler(
+        entry_points=[CallbackQueryHandler(iniciar_creacion, pattern="^(btn_crear|btn_diario)$")],
         states={
             TITULO: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_titulo)],
             FECHA: [
@@ -367,16 +680,29 @@ if __name__ == '__main__':
             HORA: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_hora)],
             DURACION: [CallbackQueryHandler(finalizar_creacion, pattern="^dur_")]
         },
-        fallbacks=[CommandHandler("cancelar", cancelar)]
+        fallbacks=[CommandHandler("cancelar", cancelar)],
+    )
+
+    conv_reagendar = ConversationHandler(
+        entry_points=[CallbackQueryHandler(iniciar_reagendar, pattern="^resched_")],
+        states={
+            REAGENDAR_FECHA: [
+                CallbackQueryHandler(reagendar_recibir_fecha_boton, pattern="^rfecha_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, reagendar_recibir_fecha_texto)
+            ],
+            REAGENDAR_HORA: [MessageHandler(filters.TEXT & ~filters.COMMAND, reagendar_recibir_hora)]
+        },
+        fallbacks=[CommandHandler("cancelar", cancelar)],
     )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", start))
-    app.add_handler(conv_handler)
+    app.add_handler(conv_crear)
+    app.add_handler(conv_reagendar)
     app.add_handler(CallbackQueryHandler(menu_callback_handler))
 
     if app.job_queue:
         app.job_queue.run_repeating(verificar_recordatorios, interval=60, first=10)
 
-    print("🤖 Bot de Agenda con menú interactivo encendido...")
-    app.run_polling()
+    print("🤖 Bot de Agenda con menú interactivo encendido...", flush=True)
+    app.run_polling(drop_pending_updates=True)
