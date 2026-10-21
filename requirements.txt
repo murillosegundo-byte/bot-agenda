@@ -1,4 +1,4 @@
-python-telegram-bot
+python-telegram-bot[job-queue]
 google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
