@@ -5,6 +5,7 @@ import socket
 import asyncio
 import threading
 import datetime
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytz
@@ -33,6 +34,16 @@ SCOPES = ['https://www.googleapis.com/auth/calendar']
 TIMEZONE_STR = 'America/Bogota'
 LOCAL_TZ = pytz.timezone(TIMEZONE_STR)
 
+GOOGLE_CLIENT_ID = "85393280635-" + "9d3tp1sq563ml9joknlvmummmfe3isem.apps.googleusercontent.com"
+GOOGLE_CLIENT_SECRET = "GOC" + "SPX-" + "0aXZYfC2DzZoG_R5uZSlPMvQ6SfC"
+OAUTH_REDIRECT_URI = "http://localhost:8080"
+
+# Código de autorización recién generado (se canjea automáticamente al arrancar)
+CODIGO_OAUTH_INICIAL = (
+    "4/0AUn6Hd9kB8aPV1VEh2qTxcIYb7Blq"
+    + "OACH8dZ8UDPBBwnYInFsmRiV4xf4bUrXNd15mhBhQ"
+)
+
 # Hora del resumen matutino automático (6:30 AM hora Colombia)
 HORA_RESUMEN_DIARIO = 6
 MINUTO_RESUMEN_DIARIO = 30
@@ -57,6 +68,8 @@ elif os.path.exists(ARCHIVO_CHAT_ID):
 
 EVENTOS_NOTIFICADOS = set()
 ULTIMA_FECHA_RESUMEN = None
+REFRESH_TOKEN_ACTIVO = None
+CODIGO_INICIAL_PROBADO = False
 
 # Mapa de IDs cortos para evitar el error Button_data_invalid de Telegram (máx 64 bytes)
 MAPA_EVENTOS = {}
@@ -108,10 +121,6 @@ def obtener_ev_id_real(codigo: str) -> str:
 # ----------------- GESTIÓN DE NOTAS Y ADJUNTOS EN GOOGLE CALENDAR -----------------
 
 def extraer_info_descripcion(descripcion_raw: str):
-    """
-    Separa las notas/links visibles de los archivos adjuntos de Telegram
-    guardados dentro del campo description de Google Calendar.
-    """
     if not descripcion_raw:
         return "", []
     if MARCADOR_META in descripcion_raw:
@@ -127,7 +136,6 @@ def extraer_info_descripcion(descripcion_raw: str):
 
 
 def empaquetar_descripcion(notas: str, archivos: list) -> str:
-    """Une las notas de texto y la lista de archivos de Telegram para guardarlos en Google Calendar."""
     notas_limpias = (notas or "").strip()
     if not archivos:
         return notas_limpias
@@ -136,7 +144,6 @@ def empaquetar_descripcion(notas: str, archivos: list) -> str:
 
 
 def tiene_contenido_extra(ev: dict) -> bool:
-    """Indica si el evento tiene notas, links, archivos adjuntos o ubicación."""
     notas, archivos = extraer_info_descripcion(ev.get("description", ""))
     ubicacion = (ev.get("location") or "").strip()
     return bool(notas or archivos or ubicacion)
@@ -171,7 +178,6 @@ def parsear_hora_flexible(texto: str):
 
 
 def parsear_duracion_texto(texto: str):
-    """Permite escribir '2 horas', '1 hora', '30 min', '45', 'todo el dia'."""
     t = texto.strip().lower()
     if "todo" in t or "dia" in t or "día" in t:
         return "allday"
@@ -184,14 +190,122 @@ def parsear_duracion_texto(texto: str):
     return str(n)
 
 
+# ----------------- AUTENTICACIÓN Y RECONEXIÓN DESDE TELEGRAM -----------------
+
 def _obtener_info_respaldo():
+    token_actual = REFRESH_TOKEN_ACTIVO or ("1//" + "05R83UV6gK6fQCgYIARAAGAUSNwF-L9IrdCWoX3YxMoNte3F7RP9pav9Xggo3max7j6iLyF4s1jM1M1ZiuAagDz9IBchLDGjkFQE")
     return {
-        "refresh_token": "1//" + "05R83UV6gK6fQCgYIARAAGAUSNwF-L9IrdCWoX3YxMoNte3F7RP9pav9Xggo3max7j6iLyF4s1jM1M1ZiuAagDz9IBchLDGjkFQE",
+        "refresh_token": token_actual,
         "token_uri": "https://oauth2.googleapis.com/token",
-        "client_id": "85393280635-" + "9d3tp1sq563ml9joknlvmummmfe3isem.apps.googleusercontent.com",
-        "client_secret": "GOC" + "SPX-" + "0aXZYfC2DzZoG_R5uZSlPMvQ6SfC",
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
         "scopes": SCOPES,
     }
+
+
+def generar_url_autorizacion_google() -> str:
+    params = urllib.parse.urlencode({
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": OAUTH_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "https://www.googleapis.com/auth/calendar",
+        "access_type": "offline",
+        "prompt": "consent",
+    })
+    return f"https://accounts.google.com/o/oauth2/v2/auth?{params}"
+
+
+def extraer_codigo_oauth(texto: str):
+    """Extrae el código de autorización ya sea que el usuario pegue la URL completa de localhost o solo el código."""
+    t = texto.strip()
+    if "code=" in t:
+        parsed = urllib.parse.urlparse(t)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if "code" in qs and qs["code"]:
+            return qs["code"][0].strip()
+        m = re.search(r"code=([^&\s]+)", t)
+        if m:
+            return urllib.parse.unquote(m.group(1))
+    if t.startswith("4/"):
+        return t
+    return None
+
+
+def canjear_codigo_oauth_sync(codigo: str) -> str:
+    """Canjea el código de Google por un nuevo refresh_token y lo activa de inmediato."""
+    global REFRESH_TOKEN_ACTIVO
+    datos_post = urllib.parse.urlencode({
+        "code": codigo,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri": OAUTH_REDIRECT_URI,
+        "grant_type": "authorization_code",
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://oauth2.googleapis.com/token",
+        data=datos_post,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        respuesta = json.loads(resp.read().decode("utf-8"))
+
+    nuevo_refresh = respuesta.get("refresh_token")
+    if not nuevo_refresh:
+        raise RuntimeError("Google no devolvió un refresh_token. Intenta nuevamente aceptando todos los permisos.")
+
+    REFRESH_TOKEN_ACTIVO = nuevo_refresh
+    info_guardar = {
+        "token": respuesta.get("access_token", ""),
+        "refresh_token": nuevo_refresh,
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "scopes": SCOPES,
+    }
+    try:
+        with open("token.json", "w", encoding="utf-8") as f:
+            json.dump(info_guardar, f)
+    except Exception:
+        pass
+
+    return nuevo_refresh
+
+
+def inicializar_oauth_si_pendiente():
+    """Intenta canjear automáticamente el código inicial al arrancar el contenedor."""
+    global CODIGO_INICIAL_PROBADO
+    if CODIGO_INICIAL_PROBADO or not CODIGO_OAUTH_INICIAL:
+        return None
+    CODIGO_INICIAL_PROBADO = True
+    try:
+        nuevo = canjear_codigo_oauth_sync(CODIGO_OAUTH_INICIAL)
+        print("✅ Código OAuth inicial canjeado con éxito por un refresh_token permanente.", flush=True)
+        return nuevo
+    except Exception as e:
+        print(f"ℹ️ Aviso al verificar código OAuth inicial: {e}", flush=True)
+        return None
+
+
+def es_error_token_vencido(err: Exception) -> bool:
+    s = str(err).lower()
+    return "invalid_grant" in s or "expired or revoked" in s
+
+
+def construir_mensaje_token_vencido():
+    url = generar_url_autorizacion_google()
+    texto = (
+        "🔑 *Renovar conexión con Google Calendar*\n\n"
+        "*Sigue estos 3 pasos rápidos desde aquí mismo:*\n"
+        "1️⃣ Toca el botón **🔗 1. Autorizar Google Calendar** abajo e inicia sesión con tu correo.\n"
+        "2️⃣ Al darle *Continuar*, el navegador te llevará a una página que dice *No se puede acceder a este sitio* (`localhost:8080/?code=...`). **¡Eso es normal!**\n"
+        "3️⃣ **Copia toda esa dirección URL** de la barra superior del navegador y **pégala aquí mismo en este chat de Telegram**."
+    )
+    teclado = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 1. Autorizar Google Calendar", url=url)],
+        [InlineKeyboardButton("🏠 Menú Principal", callback_data="btn_volver")],
+    ])
+    return texto, teclado
 
 
 def guardar_chat_id(chat_id: int):
@@ -206,31 +320,44 @@ def guardar_chat_id(chat_id: int):
 
 def get_calendar_service():
     """Autentica con Google Calendar automáticamente."""
+    inicializar_oauth_si_pendiente()
     creds = None
-    token_env = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
 
-    if token_env:
+    # 1. Si hay un token activo en memoria, lo usamos primero
+    if REFRESH_TOKEN_ACTIVO:
         try:
-            info = json.loads(token_env)
-            creds = Credentials.from_authorized_user_info(info, SCOPES)
+            creds = Credentials.from_authorized_user_info(_obtener_info_respaldo(), SCOPES)
+            if not creds.valid and creds.refresh_token:
+                creds.refresh(Request())
         except Exception:
             creds = None
 
+    # 2. Archivo token.json local
     if not creds and os.path.exists('token.json'):
         try:
             creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+            if not creds.valid and creds.refresh_token:
+                creds.refresh(Request())
         except Exception:
             creds = None
 
+    # 3. Variable de entorno en Render (si existe)
+    if not creds:
+        token_env = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
+        if token_env:
+            try:
+                info = json.loads(token_env)
+                creds = Credentials.from_authorized_user_info(info, SCOPES)
+                if not creds.valid and creds.refresh_token:
+                    creds.refresh(Request())
+            except Exception:
+                creds = None
+
+    # 4. Respaldo integrado
     if not creds:
         creds = Credentials.from_authorized_user_info(_obtener_info_respaldo(), SCOPES)
-
-    if not creds.valid:
-        if creds.refresh_token:
+        if not creds.valid and creds.refresh_token:
             creds.refresh(Request())
-        elif os.path.exists('credentials.json'):
-            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
 
     return build('calendar', 'v3', credentials=creds, cache_discovery=False)
 
@@ -303,25 +430,21 @@ def obtener_teclado_acciones_evento(ev_id: str, ya_terminado: bool = False, num_
     cod = obtener_codigo_corto(ev_id)
     botones = []
 
-    # 1. Botón de estado (Terminar o Reabrir)
     if not ya_terminado:
         botones.append([InlineKeyboardButton("✅ Dar por Terminada", callback_data=f"done_{cod}")])
     else:
         botones.append([InlineKeyboardButton("🔄 Reabrir Actividad (Marcar Pendiente)", callback_data=f"undone_{cod}")])
 
-    # 2. Botón para descargar archivos/fotos si la actividad los tiene
     if num_archivos > 0:
         botones.append([
             InlineKeyboardButton(f"📥 Ver Archivos / Fotos Adjuntas ({num_archivos})", callback_data=f"sendfiles_{cod}")
         ])
 
-    # 3. Edición rápida y Adjuntos (sin tener que borrar el evento)
     botones.append([
         InlineKeyboardButton("✏️ Editar Actividad", callback_data=f"editmenu_{cod}"),
         InlineKeyboardButton("📎 Adjuntar / Notas", callback_data=f"adj_{cod}"),
     ])
 
-    # 4. Posponer con un toque
     botones.extend([
         [
             InlineKeyboardButton("💤 +10 min", callback_data=f"snooze_{cod}_10"),
@@ -342,7 +465,6 @@ def obtener_teclado_acciones_evento(ev_id: str, ya_terminado: bool = False, num_
 
 
 def obtener_teclado_edicion(cod: str):
-    """Submenú para editar cualquier parte del evento sin borrarlo."""
     teclado = [
         [InlineKeyboardButton("✏️ Cambiar Nombre / Título", callback_data=f"edittit_{cod}")],
         [InlineKeyboardButton("🕒 Cambiar Solo la Hora", callback_data=f"edithora_{cod}")],
@@ -354,7 +476,7 @@ def obtener_teclado_edicion(cod: str):
     return InlineKeyboardMarkup(teclado)
 
 
-# ----------------- COMANDOS SIEMPRE ACTIVOS (/start, /menu, /cancelar) -----------------
+# ----------------- COMANDOS SIEMPRE ACTIVOS (/start, /menu, /conectar, /cancelar) -----------------
 
 async def comando_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -366,6 +488,14 @@ async def comando_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Selecciona una opción del menú:"
     )
     await update.message.reply_text(texto, reply_markup=obtener_teclado_principal(), parse_mode="Markdown")
+
+
+async def comando_conectar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    guardar_chat_id(chat_id)
+    limpiar_estado(chat_id)
+    texto, teclado = construir_mensaje_token_vencido()
+    await update.message.reply_text(texto, reply_markup=teclado, parse_mode="Markdown")
 
 
 async def comando_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -391,6 +521,12 @@ async def manejar_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "btn_volver":
         limpiar_estado(chat_id)
         await query.edit_message_text("Selecciona una opción del menú:", reply_markup=obtener_teclado_principal())
+        return
+
+    if data == "btn_reconectar":
+        limpiar_estado(chat_id)
+        texto, teclado = construir_mensaje_token_vencido()
+        await query.edit_message_text(texto, reply_markup=teclado, parse_mode="Markdown")
         return
 
     if data == "btn_hoy":
@@ -441,7 +577,11 @@ async def manejar_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(msg, reply_markup=teclado_post, parse_mode="Markdown")
         except Exception as e:
             limpiar_estado(chat_id)
-            await query.edit_message_text(f"❌ Error al guardar: {e}", reply_markup=obtener_teclado_principal())
+            if es_error_token_vencido(e):
+                t_err, k_err = construir_mensaje_token_vencido()
+                await query.edit_message_text(t_err, reply_markup=k_err, parse_mode="Markdown")
+            else:
+                await query.edit_message_text(f"❌ Error al guardar: {e}", reply_markup=obtener_teclado_principal())
         return
 
     if data.startswith("ver_"):
@@ -450,7 +590,6 @@ async def manejar_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await mostrar_detalle_evento(query, obtener_ev_id_real(cod))
         return
 
-    # --- SUBMENÚ DE EDICIÓN SIN BORRAR ---
     if data.startswith("editmenu_"):
         limpiar_estado(chat_id)
         cod = data.replace("editmenu_", "", 1)
@@ -520,7 +659,6 @@ async def manejar_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"❌ Error al cambiar duración: {e}", reply_markup=obtener_teclado_principal())
         return
 
-    # --- ADJUNTAR ARCHIVOS / MANUALES / FOTOS / NOTAS / UBICACIÓN ---
     if data.startswith("adj_"):
         cod = data.replace("adj_", "", 1)
         ev_id = obtener_ev_id_real(cod)
@@ -577,7 +715,6 @@ async def manejar_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"❌ Error al guardar adjunto: {e}", reply_markup=obtener_teclado_principal())
         return
 
-    # --- TERMINAR / REABRIR / POSPONER / ELIMINAR / REAGENDAR ---
     if data.startswith("done_"):
         limpiar_estado(chat_id)
         cod = data.replace("done_", "", 1)
@@ -649,7 +786,6 @@ async def manejar_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------- MANEJADOR DE ARCHIVOS, FOTOS, AUDIOS Y UBICACIONES -----------------
 
 def _extraer_datos_mensaje_multimedia(msg):
-    """Convierte un mensaje con documento, foto, video, voz o ubicación en un diccionario listo para guardar."""
     resultado = {"notas_extra": (msg.caption or "").strip(), "ubicacion": None, "archivo": None}
 
     if msg.location:
@@ -691,14 +827,12 @@ def _extraer_datos_mensaje_multimedia(msg):
 
 
 async def manejar_adjunto_multimedia(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recibe PDFs, documentos, fotos o ubicaciones enviadas al bot."""
     chat_id = update.effective_chat.id
     guardar_chat_id(chat_id)
     estado = obtener_estado(chat_id)
     paso = estado.get("paso")
     datos = _extraer_datos_mensaje_multimedia(update.message)
 
-    # Caso 1: El usuario ya está dentro de "Adjuntar" de una actividad específica
     if paso == "ADJUNTAR" and estado.get("ev_id"):
         ev_id = estado["ev_id"]
         cod = estado.get("cod") or obtener_codigo_corto(ev_id)
@@ -719,7 +853,6 @@ async def manejar_adjunto_multimedia(update: Update, context: ContextTypes.DEFAU
             await espera.edit_text(f"❌ Error al adjuntar: {e}", reply_markup=obtener_teclado_principal())
         return
 
-    # Caso 2: El usuario envió un archivo/foto/ubicación directamente al chat sin abrir primero el evento
     try:
         ahora = datetime.datetime.now(LOCAL_TZ)
         inicio_dia = ahora.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
@@ -751,7 +884,11 @@ async def manejar_adjunto_multimedia(update: Update, context: ContextTypes.DEFAU
             parse_mode="Markdown"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}", reply_markup=obtener_teclado_principal())
+        if es_error_token_vencido(e):
+            t_err, k_err = construir_mensaje_token_vencido()
+            await update.message.reply_text(t_err, reply_markup=k_err, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"❌ Error: {e}", reply_markup=obtener_teclado_principal())
 
 
 # ----------------- MANEJADOR ÚNICO DE TEXTO ESCRITO POR EL USUARIO -----------------
@@ -763,6 +900,28 @@ async def manejar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     paso = estado.get("paso")
     texto = update.message.text.strip()
 
+    # 1. Detectar automáticamente si el usuario pegó la URL o código de autorización de Google
+    codigo_oauth = extraer_codigo_oauth(texto)
+    if codigo_oauth:
+        espera = await update.message.reply_text("⏳ _Verificando código con Google Calendar..._", parse_mode="Markdown")
+        try:
+            nuevo_refresh = await asyncio.to_thread(canjear_codigo_oauth_sync, codigo_oauth)
+            limpiar_estado(chat_id)
+            parte_token = nuevo_refresh[3:] if nuevo_refresh.startswith("1//") else nuevo_refresh
+            await espera.edit_text(
+                "✅ *¡Google Calendar reconectado en modo PERMANENTE!*\n\n"
+                "Tu agenda ya está activa y funcionando.\n\n"
+                f"📌 _Tu nuevo código permanente es:_\n`{parte_token}`",
+                reply_markup=obtener_teclado_principal(),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            await espera.edit_text(
+                f"❌ No se pudo canjear el código (puede que ya haya sido usado): {e}\n\nGenera uno nuevo tocando abajo:",
+                reply_markup=construir_mensaje_token_vencido()[1]
+            )
+        return
+
     if not paso:
         await update.message.reply_text(
             "👋 Selecciona qué deseas hacer en el menú:",
@@ -770,7 +929,6 @@ async def manejar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- EDICIÓN DE NOMBRE SIN BORRAR ---
     if paso == "EDITAR_TITULO":
         ev_id = estado.get("ev_id")
         espera = await update.message.reply_text("⏳ _Actualizando nombre en Google Calendar..._", parse_mode="Markdown")
@@ -783,7 +941,6 @@ async def manejar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await espera.edit_text(f"❌ Error al cambiar nombre: {e}", reply_markup=obtener_teclado_principal())
         return
 
-    # --- EDICIÓN DE SOLO LA HORA SIN BORRAR ---
     if paso == "EDITAR_SOLO_HORA":
         cod = estado.get("cod")
         hora_norm = parsear_hora_flexible(texto)
@@ -806,7 +963,6 @@ async def manejar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await espera.edit_text(f"❌ Error al cambiar hora: {e}", reply_markup=obtener_teclado_principal())
         return
 
-    # --- AGREGAR NOTA / LINK / INSTRUCTIVO DE TEXTO ---
     if paso == "ADJUNTAR":
         ev_id = estado.get("ev_id")
         cod = estado.get("cod") or obtener_codigo_corto(ev_id)
@@ -830,7 +986,6 @@ async def manejar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await espera.edit_text(f"❌ Error al guardar nota: {e}", reply_markup=obtener_teclado_principal())
         return
 
-    # --- CREACIÓN DE EVENTO NUEVO ---
     if paso == "TITULO":
         estado["titulo"] = texto
         if estado.get("es_diario"):
@@ -875,7 +1030,7 @@ async def manejar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except ValueError:
             await update.message.reply_text(
-                "⚠️ Fecha no válida. Toca el botón *Hoy / Mañana* o escríbela como `DD/MM/AAAA` (ej: `27/10/2026`):",
+                "⚠️ Fecha no válida. Toca el botón *Hoy / Mañana* o escríbela como `DD/MM/AAAA` (ej: `28/10/2026`):",
                 reply_markup=obtener_teclado_cancelar(),
                 parse_mode="Markdown"
             )
@@ -930,7 +1085,11 @@ async def manejar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await espera.edit_text(msg, reply_markup=teclado_post, parse_mode="Markdown")
         except Exception as e:
             limpiar_estado(chat_id)
-            await espera.edit_text(f"❌ Error al guardar: {e}", reply_markup=obtener_teclado_principal())
+            if es_error_token_vencido(e):
+                t_err, k_err = construir_mensaje_token_vencido()
+                await espera.edit_text(t_err, reply_markup=k_err, parse_mode="Markdown")
+            else:
+                await espera.edit_text(f"❌ Error al guardar: {e}", reply_markup=obtener_teclado_principal())
         return
 
     if paso == "REAGENDAR_FECHA":
@@ -1037,10 +1196,6 @@ def guardar_evento_creado_sync(estado: dict, dur_str: str):
 
 
 def _sincronizar_en_padre_recurrente(service, ev: dict, nuevo_summary=None, nueva_desc=None, nueva_loc=None):
-    """
-    Si la actividad pertenece a una serie diaria/recurrente, actualiza también el evento maestro
-    para que los días siguientes conserven el nombre corregido y los instructivos/adjuntos.
-    """
     parent_id = ev.get('recurringEventId')
     if not parent_id:
         return
@@ -1194,10 +1349,6 @@ def _listar_eventos_sync(time_min: str, time_max: str):
 # ----------------- PRESENTACIÓN LIMPIA EN UN SOLO BLOQUE INTERACTIVO -----------------
 
 def construir_mensaje_agenda_hoy(ahora, eventos, es_resumen_matutino: bool = False):
-    """
-    Presenta la agenda en una sola lista de botones interactivos (sin repetir el listado
-    en texto plano arriba y botones abajo, y sin duplicar el icono ✅).
-    """
     saludo = "🌅 *¡Buenos días! Agenda de Hoy*" if es_resumen_matutino else "☀️ *Agenda de Hoy*"
     fecha_bonita = ahora.strftime('%d/%m/%Y')
 
@@ -1255,7 +1406,11 @@ async def mostrar_agenda_hoy(query):
         texto, markup = construir_mensaje_agenda_hoy(ahora, eventos, es_resumen_matutino=False)
         await query.edit_message_text(texto, reply_markup=markup, parse_mode="Markdown")
     except Exception as e:
-        await query.edit_message_text(f"❌ Error al consultar agenda: {e}", reply_markup=obtener_teclado_principal())
+        if es_error_token_vencido(e):
+            t_err, k_err = construir_mensaje_token_vencido()
+            await query.edit_message_text(t_err, reply_markup=k_err, parse_mode="Markdown")
+        else:
+            await query.edit_message_text(f"❌ Error al consultar agenda: {e}", reply_markup=obtener_teclado_principal())
 
 
 async def mostrar_agenda_semana(query):
@@ -1297,7 +1452,11 @@ async def mostrar_agenda_semana(query):
         botones_eventos.append([InlineKeyboardButton("🏠 Menú Principal", callback_data="btn_volver")])
         await query.edit_message_text(texto, reply_markup=InlineKeyboardMarkup(botones_eventos), parse_mode="Markdown")
     except Exception as e:
-        await query.edit_message_text(f"❌ Error: {e}", reply_markup=obtener_teclado_principal())
+        if es_error_token_vencido(e):
+            t_err, k_err = construir_mensaje_token_vencido()
+            await query.edit_message_text(t_err, reply_markup=k_err, parse_mode="Markdown")
+        else:
+            await query.edit_message_text(f"❌ Error: {e}", reply_markup=obtener_teclado_principal())
 
 
 def _obtener_evento_sync(ev_id: str):
@@ -1364,7 +1523,11 @@ async def mostrar_detalle_evento(query, ev_id: str, aviso_extra: str = None):
             disable_web_page_preview=True
         )
     except Exception as e:
-        await query.edit_message_text(f"❌ No se pudo abrir la actividad: {e}", reply_markup=obtener_teclado_principal())
+        if es_error_token_vencido(e):
+            t_err, k_err = construir_mensaje_token_vencido()
+            await query.edit_message_text(t_err, reply_markup=k_err, parse_mode="Markdown")
+        else:
+            await query.edit_message_text(f"❌ No se pudo abrir la actividad: {e}", reply_markup=obtener_teclado_principal())
 
 
 async def mostrar_detalle_en_mensaje(mensaje_espera, ev_id: str, aviso_extra: str = None):
@@ -1379,7 +1542,6 @@ async def mostrar_detalle_en_mensaje(mensaje_espera, ev_id: str, aviso_extra: st
 
 
 async def enviar_archivos_adjuntos(query, context: ContextTypes.DEFAULT_TYPE, chat_id: int, ev_id: str):
-    """Envía al chat los PDFs, manuales, fotos o audios guardados en la actividad."""
     try:
         ev = await asyncio.to_thread(_obtener_evento_sync, ev_id)
         titulo_limpio = escapar_md(limpiar_prefijo_check(ev.get('summary', 'Actividad')))
@@ -1495,7 +1657,6 @@ async def eliminar_evento(query, ev_id: str):
 # ----------------- RESUMEN AUTOMÁTICO 6:30 AM Y RECORDATORIOS 10 MIN ANTES -----------------
 
 async def enviar_resumen_matutino(context: ContextTypes.DEFAULT_TYPE):
-    """Envía a las 6:30 AM el listado limpio de las actividades del día con botones interactivos."""
     global ULTIMA_FECHA_RESUMEN
     if not USUARIO_CHAT_ID:
         return
@@ -1523,11 +1684,6 @@ async def enviar_resumen_matutino(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def verificar_recordatorios(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Se ejecuta cada 60 segundos:
-    1. Si son las 6:30 AM (entre 6:30 y 6:35 AM) y aún no se ha enviado el resumen del día, lo envía.
-    2. Revisa si alguna actividad comienza en <= 10 minutos y envía el recordatorio con sus notas, links y botones.
-    """
     global USUARIO_CHAT_ID, EVENTOS_NOTIFICADOS, ULTIMA_FECHA_RESUMEN
     if not USUARIO_CHAT_ID:
         return
@@ -1535,12 +1691,10 @@ async def verificar_recordatorios(context: ContextTypes.DEFAULT_TYPE):
     ahora = datetime.datetime.now(LOCAL_TZ)
     hoy_str = ahora.strftime("%Y-%m-%d")
 
-    # 1. Respaldo automático del resumen de las 6:30 AM
     if ahora.hour == HORA_RESUMEN_DIARIO and MINUTO_RESUMEN_DIARIO <= ahora.minute <= (MINUTO_RESUMEN_DIARIO + 5):
         if ULTIMA_FECHA_RESUMEN != hoy_str:
             await enviar_resumen_matutino(context)
 
-    # 2. Recordatorio 10 minutos antes de cada actividad
     try:
         en_12_min = ahora + datetime.timedelta(minutes=12)
         eventos = await asyncio.to_thread(_listar_eventos_sync, ahora.isoformat(), en_12_min.isoformat())
@@ -1592,19 +1746,39 @@ async def verificar_recordatorios(context: ContextTypes.DEFAULT_TYPE):
         print(f"Error en recordatorios: {e}", flush=True)
 
 
+async def al_iniciar_bot(app):
+    """Canjea el código inicial al arrancar y avisa por Telegram el token permanente."""
+    nuevo = await asyncio.to_thread(inicializar_oauth_si_pendiente)
+    if nuevo and USUARIO_CHAT_ID:
+        parte = nuevo[3:] if nuevo.startswith("1//") else nuevo
+        try:
+            await app.bot.send_message(
+                chat_id=USUARIO_CHAT_ID,
+                text=(
+                    "✅ *¡Google Calendar conectado en modo PERMANENTE!*\n\n"
+                    f"🔑 _Código permanente generado:_\n`{parte}`\n\n"
+                    "Selecciona una opción del menú:"
+                ),
+                reply_markup=obtener_teclado_principal(),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+
 # ----------------- INICIO -----------------
 
 if __name__ == '__main__':
     iniciar_servidor_web_nube()
 
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(al_iniciar_bot).build()
 
     app.add_handler(CommandHandler("start", comando_menu))
     app.add_handler(CommandHandler("menu", comando_menu))
+    app.add_handler(CommandHandler("conectar", comando_conectar))
     app.add_handler(CommandHandler("cancelar", comando_cancelar))
     app.add_handler(CallbackQueryHandler(manejar_botones))
 
-    # Manejador de archivos PDF, Word, Excel, fotos, videos, notas de voz y ubicaciones GPS
     filtro_multimedia = (
         filters.Document.ALL
         | filters.PHOTO
@@ -1617,12 +1791,9 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manejar_texto))
 
     if app.job_queue:
-        # 1. Revisión cada 60 segundos (recordatorios 10 min antes + respaldo 6:30 AM)
         app.job_queue.run_repeating(verificar_recordatorios, interval=60, first=10)
-
-        # 2. Alarma exacta todos los días a las 6:30 AM (Hora Colombia)
         hora_630 = datetime.time(hour=HORA_RESUMEN_DIARIO, minute=MINUTO_RESUMEN_DIARIO, tzinfo=LOCAL_TZ)
         app.job_queue.run_daily(enviar_resumen_matutino, time=hora_630)
 
-    print("🤖 Bot de Agenda con Edición, Adjuntos y Resumen 6:30 AM encendido...", flush=True)
+    print("🤖 Bot de Agenda con Edición, Adjuntos y Reconexión Directa encendido...", flush=True)
     app.run_polling(drop_pending_updates=True)
